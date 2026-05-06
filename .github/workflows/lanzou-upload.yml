@@ -10,6 +10,9 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - name: 安装依赖
+        run: pip install requests-toolbelt
+
       - name: 蓝奏云上传
         env:
           LANZOU_ACCOUNTS: ${{ secrets.LANZOU_ACCOUNTS }}
@@ -118,22 +121,51 @@ jobs:
           vei = veis[-1] if veis else ""
           print(f"uid={uid}")
 
-          # ========== 4. 上传文件 ==========
+          # ========== 4. 上传文件(带真实进度回报) ==========
           print(f"\n=== 4. 上传文件 ===")
-          # 不改后缀，用 type=MP3 骗过蓝奏云文件类型检测（与Java直传一致）
           upload_name = file_name
+          file_size = os.path.getsize(local_file)
+          print(f"文件大小: {file_size/1024/1024:.1f} MB")
 
-          t1 = time.time()
+          # 进度回报函数
+          last_report_time = [0]
+          def report_progress(bytes_read, total):
+              now = time.time()
+              if now - last_report_time[0] < 2:
+                  return  # 每 2 秒报一次
+              last_report_time[0] = now
+              # 上传占 10%~90% 的进度(0-900 千分位中的 100-810)
+              thousandth = int(100 + bytes_read * 710 / total)
+              try:
+                  requests.post(
+                      f"{callback_url}/api/callback/lanzou-progress",
+                      json={"appId": app_id, "ossId": int(oss_id), "progress": thousandth},
+                      headers={"X-Callback-Secret": callback_secret},
+                      timeout=5
+                  )
+              except:
+                  pass  # 进度回报失败不影响上传
+
+          # 用 chunked 读取 + 自定义 body 实现进度追踪
+          from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
+
           with open(local_file, "rb") as f:
-              r = session.post(f"{BASE}/html5up.php", data={
+              encoder = MultipartEncoder(fields={
                   "task": "1", "folder_id": folder_id, "id": "WU_FILE_0",
                   "name": upload_name, "type": "MP3",
-                  "size": str(os.path.getsize(local_file)),
-              }, files={
+                  "size": str(file_size),
                   "upload_file": (upload_name, f, "audio/mpeg")
-              }, headers={
-                  "Referer": f"{BASE}/mydisk.php?item=files&action=index&u={ylogin}"
-              }, timeout=600)
+              })
+              monitor = MultipartEncoderMonitor(encoder, lambda m: report_progress(m.bytes_read, m.len))
+
+              t1 = time.time()
+              r = session.post(f"{BASE}/html5up.php",
+                  data=monitor,
+                  headers={
+                      "Content-Type": monitor.content_type,
+                      "Referer": f"{BASE}/mydisk.php?item=files&action=index&u={ylogin}"
+                  },
+                  timeout=600)
           t2 = time.time()
 
           result = r.json()
