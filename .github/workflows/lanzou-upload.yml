@@ -65,16 +65,34 @@ jobs:
           session = requests.Session()
           session.headers.update({"User-Agent": UA})
 
-          # ========== 1. 下载 APK ==========
+          # ========== 1. 下载 APK(带进度回报 0-10%) ==========
           print(f"\n=== 1. 下载 APK ===")
           local_file = file_name
           for attempt in range(6):
               try:
                   r = session.get(wasabi_url, timeout=120, stream=True)
                   if r.status_code == 200:
+                      total_size = int(r.headers.get('content-length', 0))
+                      downloaded = 0
+                      last_dl_report = [0]
                       with open(local_file, "wb") as f:
-                          for chunk in r.iter_content(chunk_size=8192):
+                          for chunk in r.iter_content(chunk_size=65536):
                               f.write(chunk)
+                              downloaded += len(chunk)
+                              # 下载进度占 0-100 千分位(0-10%)
+                              now = time.time()
+                              if total_size > 0 and now - last_dl_report[0] >= 0.5:
+                                  last_dl_report[0] = now
+                                  dl_progress = int(downloaded * 100 / total_size)
+                                  try:
+                                      requests.post(
+                                          f"{callback_url}/api/callback/lanzou-progress",
+                                          json={"appId": app_id, "ossId": int(oss_id), "progress": dl_progress},
+                                          headers={"X-Callback-Secret": callback_secret},
+                                          timeout=3
+                                      )
+                                  except:
+                                      pass
                       size_mb = os.path.getsize(local_file) / 1024 / 1024
                       print(f"下载完成: {size_mb:.1f} MB")
                       break
@@ -127,24 +145,23 @@ jobs:
           file_size = os.path.getsize(local_file)
           print(f"文件大小: {file_size/1024/1024:.1f} MB")
 
-          # 进度回报函数
+          # 进度回报函数(上传阶段占 100-810 千分位 = 10%-81%)
           last_report_time = [0]
           def report_progress(bytes_read, total):
               now = time.time()
-              if now - last_report_time[0] < 2:
-                  return  # 每 2 秒报一次
+              if now - last_report_time[0] < 0.5:
+                  return  # 每 500ms 报一次
               last_report_time[0] = now
-              # 上传占 10%~90% 的进度(0-900 千分位中的 100-810)
               thousandth = int(100 + bytes_read * 710 / total)
               try:
                   requests.post(
                       f"{callback_url}/api/callback/lanzou-progress",
                       json={"appId": app_id, "ossId": int(oss_id), "progress": thousandth},
                       headers={"X-Callback-Secret": callback_secret},
-                      timeout=5
+                      timeout=3
                   )
               except:
-                  pass  # 进度回报失败不影响上传
+                  pass
 
           # 用 chunked 读取 + 自定义 body 实现进度追踪
           from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
