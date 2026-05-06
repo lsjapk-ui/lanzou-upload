@@ -79,11 +79,11 @@ jobs:
                           for chunk in r.iter_content(chunk_size=65536):
                               f.write(chunk)
                               downloaded += len(chunk)
-                              # 下载进度占 0-100 千分位(0-10%)
+                              # 下载进度占 10-100 千分位(1%-10%),不从 0 开始避免倒退
                               now = time.time()
                               if total_size > 0 and now - last_dl_report[0] >= 0.5:
                                   last_dl_report[0] = now
-                                  dl_progress = int(downloaded * 100 / total_size)
+                                  dl_progress = int(10 + downloaded * 90 / total_size)
                                   try:
                                       requests.post(
                                           f"{callback_url}/api/callback/lanzou-progress",
@@ -185,6 +185,14 @@ jobs:
                   timeout=600)
           t2 = time.time()
 
+          # 上传完成,立即报 810(81%)
+          try:
+              requests.post(f"{callback_url}/api/callback/lanzou-progress",
+                  json={"appId": app_id, "ossId": int(oss_id), "progress": 810},
+                  headers={"X-Callback-Secret": callback_secret}, timeout=3)
+          except:
+              pass
+
           result = r.json()
           if result.get("zt") != 1:
               print(f"上传失败: {result.get('info', '未知错误')}")
@@ -250,6 +258,14 @@ jobs:
 
           share_url = f"{is_newd}/{f_id}" if is_newd.startswith("http") else f"https://{is_newd}/{f_id}"
           print(f"分享链接: {share_url}")
+
+          # 报 900(90%) — 即将回调完成
+          try:
+              requests.post(f"{callback_url}/api/callback/lanzou-progress",
+                  json={"appId": app_id, "ossId": int(oss_id), "progress": 900},
+                  headers={"X-Callback-Secret": callback_secret}, timeout=3)
+          except:
+              pass
 
           # ========== 8. 回调服务器 ==========
           print(f"\n=== 8. 回调服务器 ===")
