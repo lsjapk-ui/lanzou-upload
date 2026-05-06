@@ -1,0 +1,231 @@
+name: 蓝奏云中转上传
+
+on:
+  repository_dispatch:
+    types: [lanzou-upload]
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 蓝奏云上传
+        env:
+          LANZOU_ACCOUNTS: ${{ secrets.LANZOU_ACCOUNTS }}
+          LANZOU_PASSWORD: ${{ secrets.LANZOU_PASSWORD }}
+          CALLBACK_URL: ${{ secrets.CALLBACK_URL }}
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          python3 << 'PYEOF'
+          import requests, re, time, os, json, sys, urllib.parse
+
+          BASE = "https://pc.woozooo.com"
+          UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+          # 解析参数
+          payload = json.loads(os.environ["PAYLOAD"])
+          accounts = json.loads(os.environ["LANZOU_ACCOUNTS"])
+          password = os.environ["LANZOU_PASSWORD"]
+          callback_url = os.environ["CALLBACK_URL"]
+          callback_secret = os.environ["CALLBACK_SECRET"]
+
+          wasabi_url = payload["wasabi_url"]
+          file_name = payload["file_name"]
+          app_id = payload["app_id"]
+          oss_id = str(payload["oss_id"])
+          secure_unique = payload.get("secure_unique", "")
+          app_version = payload.get("app_version", "")
+          old_file_id = payload.get("old_file_id", "")
+          auto_del = payload.get("auto_del", False)
+          # user_id/oss_name/fixed_file_name 从 meta 字段解析（GitHub API 限 10 属性）
+          meta = json.loads(payload.get("meta", "{}")) if isinstance(payload.get("meta"), str) else payload.get("meta", {})
+          user_id = meta.get("user_id", payload.get("user_id", 1))
+          oss_name = meta.get("oss_name", payload.get("oss_name", ""))
+          fixed_file_name = meta.get("fixed_file_name", payload.get("fixed_file_name", False))
+
+          # 获取蓝奏云账号配置
+          account = accounts.get(oss_id, {})
+          username = account.get("username", "")
+          folder_id = account.get("folder", "-1")
+
+          if not username:
+              print(f"未找到 OSS ID {oss_id} 对应的蓝奏云账号")
+              sys.exit(1)
+
+          print(f"=== 参数 ===")
+          print(f"APK: {file_name}")
+          print(f"蓝奏云账号: {username}, 文件夹: {folder_id}")
+          print(f"Wasabi URL: {wasabi_url}")
+
+          session = requests.Session()
+          session.headers.update({"User-Agent": UA})
+
+          # ========== 1. 下载 APK ==========
+          print(f"\n=== 1. 下载 APK ===")
+          local_file = file_name
+          for attempt in range(6):
+              try:
+                  r = session.get(wasabi_url, timeout=120, stream=True)
+                  if r.status_code == 200:
+                      with open(local_file, "wb") as f:
+                          for chunk in r.iter_content(chunk_size=8192):
+                              f.write(chunk)
+                      size_mb = os.path.getsize(local_file) / 1024 / 1024
+                      print(f"下载完成: {size_mb:.1f} MB")
+                      break
+                  elif r.status_code == 403 or r.status_code == 404:
+                      print(f"第{attempt+1}次: HTTP {r.status_code}，等待 10s...")
+                      time.sleep(10)
+                  else:
+                      print(f"第{attempt+1}次: HTTP {r.status_code}")
+                      time.sleep(5)
+              except Exception as e:
+                  print(f"第{attempt+1}次下载失败: {e}")
+                  time.sleep(5)
+          else:
+              print("下载 APK 失败，已重试6次")
+              sys.exit(1)
+
+          # ========== 2. 登录蓝奏云 ==========
+          print(f"\n=== 2. 登录蓝奏云 ===")
+          t0 = time.time()
+          r = session.get(f"{BASE}/account.php?action=login", timeout=30)
+          m = re.search(r'name="formhash"\s+value="([^"]+)"', r.text)
+          formhash = m.group(1) if m else ""
+
+          r = session.post(f"{BASE}/account.php", data={
+              "action": "login", "task": "login", "ref": "",
+              "formhash": formhash, "username": username, "password": password
+          }, timeout=30)
+
+          cookies = session.cookies.get_dict()
+          ylogin = cookies.get("ylogin", "")
+          phpdisk = cookies.get("phpdisk_info", "")
+
+          if not phpdisk:
+              print(f"登录失败")
+              sys.exit(1)
+          print(f"登录成功（{time.time()-t0:.1f}s），ylogin={ylogin}")
+
+          # ========== 3. 获取页面参数 ==========
+          print(f"\n=== 3. 获取页面参数 ===")
+          r = session.get(f"{BASE}/mydisk.php?item=files&action=index&folder_id={folder_id}", timeout=30)
+          uid_m = re.search(r'doupload\.php\?uid=(\d+)', r.text)
+          uid = uid_m.group(1) if uid_m else ""
+          veis = re.findall(r"'vei'\s*:\s*'([^']+)'", r.text)
+          vei = veis[-1] if veis else ""
+          print(f"uid={uid}")
+
+          # ========== 4. 上传文件 ==========
+          print(f"\n=== 4. 上传文件 ===")
+          # 不改后缀，用 type=MP3 骗过蓝奏云文件类型检测（与Java直传一致）
+          upload_name = file_name
+
+          t1 = time.time()
+          with open(local_file, "rb") as f:
+              r = session.post(f"{BASE}/html5up.php", data={
+                  "task": "1", "folder_id": folder_id, "id": "WU_FILE_0",
+                  "name": upload_name, "type": "MP3",
+                  "size": str(os.path.getsize(local_file)),
+              }, files={
+                  "upload_file": (upload_name, f, "audio/mpeg")
+              }, headers={
+                  "Referer": f"{BASE}/mydisk.php?item=files&action=index&u={ylogin}"
+              }, timeout=600)
+          t2 = time.time()
+
+          result = r.json()
+          if result.get("zt") != 1:
+              print(f"上传失败: {result.get('info', '未知错误')}")
+              sys.exit(1)
+
+          file_id = ""
+          text = result.get("text", [])
+          if isinstance(text, list) and text:
+              file_id = str(text[0].get("id", ""))
+          elif isinstance(text, str):
+              file_id = text
+          print(f"上传成功（{t2-t1:.1f}s），文件ID: {file_id}")
+
+          # ========== 5. 设置自定义链接 ==========
+          if secure_unique:
+              print(f"\n=== 5. 设置自定义链接 ===")
+              diy_name = secure_unique
+              if app_version:
+                  version_clean = re.sub(r'[^a-zA-Z0-9.\-]', '', app_version)
+                  diy_name = f"{diy_name}-{version_clean}"
+              if len(diy_name) > 50:
+                  diy_name = diy_name[:50]
+
+              r = session.post(f"{BASE}/doupload.php?uid={uid}", data={
+                  "task": "40", "file_id": file_id, "diy": diy_name, "type": "1", "vei": vei
+              }, headers={
+                  "X-Requested-With": "XMLHttpRequest",
+                  "Referer": f"{BASE}/mydisk.php?item=files&action=index"
+              }, timeout=30)
+              print(f"自定义链接: {diy_name} -> {r.json()}")
+
+          # ========== 6. 删除旧文件 ==========
+          if old_file_id and auto_del:
+              print(f"\n=== 6. 删除旧文件 ===")
+              try:
+                  r = session.post(f"{BASE}/doupload.php?uid={uid}", data={
+                      "task": "6", "file_id": old_file_id, "vei": vei
+                  }, headers={
+                      "X-Requested-With": "XMLHttpRequest",
+                      "Referer": f"{BASE}/mydisk.php?item=files&action=index"
+                  }, timeout=30)
+                  print(f"删除 {old_file_id}: {r.json().get('info','')}")
+              except Exception as e:
+                  print(f"删除失败（不影响）: {e}")
+
+          # ========== 7. 获取分享链接 ==========
+          print(f"\n=== 7. 获取分享链接 ===")
+          r = session.post(f"{BASE}/doupload.php?uid={uid}", data={
+              "task": "22", "file_id": file_id, "vei": vei
+          }, headers={
+              "X-Requested-With": "XMLHttpRequest",
+              "Referer": f"{BASE}/mydisk.php?item=files&action=index"
+          }, timeout=30)
+
+          share_result = r.json()
+          info = share_result.get("info", {})
+          if isinstance(info, dict):
+              is_newd = info.get("is_newd", "")
+              f_id = info.get("f_id", "")
+          else:
+              is_newd = share_result.get("is_newd", "")
+              f_id = share_result.get("f_id", "")
+
+          share_url = f"{is_newd}/{f_id}" if is_newd.startswith("http") else f"https://{is_newd}/{f_id}"
+          print(f"分享链接: {share_url}")
+
+          # ========== 8. 回调服务器 ==========
+          print(f"\n=== 8. 回调服务器 ===")
+          callback_data = {
+              "appId": app_id,
+              "ossId": int(oss_id),
+              "fileId": file_id,
+              "shareUrl": share_url,
+              "ossName": oss_name,
+              "fixedFileName": fixed_file_name,
+              "userId": user_id
+          }
+          try:
+              r = requests.post(
+                  f"{callback_url}/api/callback/lanzou",
+                  json=callback_data,
+                  headers={"X-Callback-Secret": callback_secret},
+                  timeout=30
+              )
+              print(f"回调结果: HTTP {r.status_code} - {r.text[:200]}")
+          except Exception as e:
+              print(f"回调失败: {e}")
+              # 即使回调失败也输出结果，方便手动处理
+              print(f"\n手动处理信息: fileId={file_id}, shareUrl={share_url}")
+
+          print(f"\n{'='*50}")
+          print(f"完成！fileId={file_id}, shareUrl={share_url}")
+          PYEOF
